@@ -495,6 +495,7 @@ DEFAULT_CONFIG = {
         "resume_display": "full",
         "busy_input_mode": "interrupt",
         "bell_on_complete": False,
+        "osc9_ready_on_waiting": False,
         "show_reasoning": False,
         "streaming": False,
         "inline_diffs": True,     # Show inline diff previews for write actions (write_file, patch, skill_manage)
@@ -2779,6 +2780,7 @@ def show_config():
     print(f"  Personality:  {display.get('personality', 'kawaii')}")
     print(f"  Reasoning:    {'on' if display.get('show_reasoning', False) else 'off'}")
     print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
+    print(f"  OSC 9 ready:  {'on' if display.get('osc9_ready_on_waiting', False) else 'off'}")
 
     # Terminal
     print()

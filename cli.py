@@ -1619,6 +1619,7 @@ class HermesCLI:
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
+        self.osc9_ready_on_waiting = CLI_CONFIG["display"].get("osc9_ready_on_waiting", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
         # busy_input_mode: "interrupt" (Enter interrupts current run) or "queue" (Enter queues for next turn)
@@ -1825,6 +1826,7 @@ class HermesCLI:
         self._last_scrollback_tool: str = ""  # last tool name printed to scrollback (for "new" dedup)
         self._command_running = False
         self._command_status = ""
+        self._last_waiting_for_user_input = None
         self._attached_images: list[Path] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
@@ -1855,6 +1857,62 @@ class HermesCLI:
         if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
             self._last_invalidate = now
             self._app.invalidate()
+
+    def _emit_terminal_escape(self, seq: str) -> None:
+        if not seq:
+            return
+        try:
+            out = getattr(sys, "__stdout__", None) or sys.stdout
+            if out is None:
+                return
+            try:
+                if hasattr(out, "isatty") and not out.isatty():
+                    return
+            except Exception:
+                return
+
+            data = seq.encode("utf-8", errors="ignore")
+            try:
+                os.write(out.fileno(), data)
+                return
+            except Exception:
+                pass
+
+            out.write(seq)
+            out.flush()
+        except Exception:
+            logger.debug("terminal escape emit failed", exc_info=True)
+
+    def _emit_ready_osc9(self) -> None:
+        if not getattr(self, "osc9_ready_on_waiting", False):
+            return
+        self._emit_terminal_escape("\x1b]9;Hermes ready\x07")
+
+    def _is_waiting_for_user_input(self) -> bool:
+        if getattr(self, "_should_exit", False):
+            return False
+        return bool(
+            getattr(self, "_sudo_state", None)
+            or getattr(self, "_secret_state", None)
+            or getattr(self, "_approval_state", None)
+            or getattr(self, "_clarify_state", None)
+            or getattr(self, "_clarify_freetext", False)
+            or (
+                not getattr(self, "_agent_running", False)
+                and not getattr(self, "_command_running", False)
+                and not getattr(self, "_voice_processing", False)
+                and not getattr(self, "_voice_recording", False)
+            )
+        )
+
+    def _sync_ready_notification(self) -> None:
+        if not getattr(self, "osc9_ready_on_waiting", False):
+            return
+        waiting = self._is_waiting_for_user_input()
+        prev = getattr(self, "_last_waiting_for_user_input", None)
+        if waiting and prev is not True:
+            self._emit_ready_osc9()
+        self._last_waiting_for_user_input = waiting
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -2647,6 +2705,7 @@ class HermesCLI:
         """Expose a temporary busy state in the TUI while a slash command runs."""
         self._command_running = True
         self._command_status = status
+        self._sync_ready_notification()
         self._invalidate(min_interval=0.0)
         try:
             print(f"⏳ {status}")
@@ -2654,6 +2713,7 @@ class HermesCLI:
         finally:
             self._command_running = False
             self._command_status = ""
+            self._sync_ready_notification()
             self._invalidate(min_interval=0.0)
 
     def _ensure_runtime_credentials(self) -> bool:
@@ -7249,6 +7309,7 @@ class HermesCLI:
         self._clarify_deadline = _time.monotonic() + timeout
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
+        self._sync_ready_notification()
 
         # Trigger prompt_toolkit repaint from this (non-main) thread
         self._invalidate()
@@ -7267,6 +7328,7 @@ class HermesCLI:
             try:
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = 0
+                self._sync_ready_notification()
                 return result
             except queue.Empty:
                 remaining = self._clarify_deadline - _time.monotonic()
@@ -7285,6 +7347,7 @@ class HermesCLI:
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
+        self._sync_ready_notification()
         self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
@@ -7310,6 +7373,7 @@ class HermesCLI:
             "response_queue": response_queue,
         }
         self._sudo_deadline = _time.monotonic() + timeout
+        self._sync_ready_notification()
 
         self._invalidate()
 
@@ -7318,6 +7382,7 @@ class HermesCLI:
                 result = response_queue.get(timeout=1)
                 self._sudo_state = None
                 self._sudo_deadline = 0
+                self._sync_ready_notification()
                 self._restore_modal_input_snapshot()
                 self._invalidate()
                 if result:
@@ -7333,6 +7398,7 @@ class HermesCLI:
 
         self._sudo_state = None
         self._sudo_deadline = 0
+        self._sync_ready_notification()
         self._restore_modal_input_snapshot()
         self._invalidate()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
@@ -7367,6 +7433,7 @@ class HermesCLI:
                 "response_queue": response_queue,
             }
             self._approval_deadline = _time.monotonic() + timeout
+            self._sync_ready_notification()
 
             self._invalidate()
 
@@ -7376,6 +7443,7 @@ class HermesCLI:
                     result = response_queue.get(timeout=1)
                     self._approval_state = None
                     self._approval_deadline = 0
+                    self._sync_ready_notification()
                     self._invalidate()
                     return result
                 except queue.Empty:
@@ -7389,6 +7457,7 @@ class HermesCLI:
 
             self._approval_state = None
             self._approval_deadline = 0
+            self._sync_ready_notification()
             self._invalidate()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
@@ -7422,6 +7491,7 @@ class HermesCLI:
 
         state["response_queue"].put(chosen)
         self._approval_state = None
+        self._sync_ready_notification()
         self._invalidate()
 
     def _get_approval_display_fragments(self):
@@ -7539,6 +7609,7 @@ class HermesCLI:
         self._secret_state["response_queue"].put(value)
         self._secret_state = None
         self._secret_deadline = 0
+        self._sync_ready_notification()
         self._invalidate()
 
     def _cancel_secret_capture(self) -> None:
@@ -8315,6 +8386,7 @@ class HermesCLI:
         # Secure secret capture state for skill setup
         self._secret_state = None       # dict with var_name, prompt, metadata, response_queue
         self._secret_deadline = 0
+        self._last_waiting_for_user_input = None
 
         # Clipboard image attachments (paste images into the CLI)
         self._attached_images: list[Path] = []
@@ -8373,6 +8445,7 @@ class HermesCLI:
                 text = event.app.current_buffer.text
                 self._sudo_state["response_queue"].put(text)
                 self._sudo_state = None
+                self._sync_ready_notification()
                 event.app.invalidate()
                 return
 
@@ -8403,6 +8476,7 @@ class HermesCLI:
                     self._clarify_state["response_queue"].put(text)
                     self._clarify_state = None
                     self._clarify_freetext = False
+                    self._sync_ready_notification()
                     event.app.current_buffer.reset()
                     event.app.invalidate()
                 return
@@ -8415,6 +8489,7 @@ class HermesCLI:
                 if selected < len(choices):
                     state["response_queue"].put(choices[selected])
                     self._clarify_state = None
+                    self._sync_ready_notification()
                     event.app.invalidate()
                 else:
                     # "Other" selected → switch to freetext
@@ -8612,6 +8687,7 @@ class HermesCLI:
             if self._sudo_state:
                 self._sudo_state["response_queue"].put("")
                 self._sudo_state = None
+                self._sync_ready_notification()
                 event.app.invalidate()
                 return
 
@@ -8626,6 +8702,7 @@ class HermesCLI:
             if self._approval_state:
                 self._approval_state["response_queue"].put("deny")
                 self._approval_state = None
+                self._sync_ready_notification()
                 event.app.invalidate()
                 return
 
@@ -8643,6 +8720,7 @@ class HermesCLI:
                 )
                 self._clarify_state = None
                 self._clarify_freetext = False
+                self._sync_ready_notification()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
@@ -9461,6 +9539,7 @@ class HermesCLI:
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         self._app = app  # Store reference for clarify_callback
+        self._sync_ready_notification()
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
         # When the terminal shrinks (e.g. un-maximize), the emulator reflows
@@ -9641,12 +9720,14 @@ class HermesCLI:
 
                     # Regular chat - run agent
                     self._agent_running = True
+                    self._sync_ready_notification()
                     app.invalidate()  # Refresh status line
 
                     try:
                         self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
+                        self._sync_ready_notification()
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
                         self._pending_tool_info.clear()
