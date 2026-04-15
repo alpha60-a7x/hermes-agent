@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -293,6 +294,34 @@ async def test_stop_hard_kills_running_agent():
 
 
 # ------------------------------------------------------------------
+# Test 6bb: /stop tears down cached agent resources too
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_stop_evicts_cached_agent_and_closes_resources():
+    """Hard-stop must tear down the cached session agent, not only unlock the
+    running-agent guard, so background resources do not survive indefinitely."""
+    runner = _make_runner()
+    session_key = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
+    )
+
+    fake_agent = MagicMock()
+    runner._running_agents[session_key] = fake_agent
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {session_key: (fake_agent, "sig")}
+
+    stop_event = _make_event(text="/stop")
+    result = await runner._handle_message(stop_event)
+
+    fake_agent.interrupt.assert_called_once_with("Stop requested")
+    fake_agent.close.assert_called_once()
+    assert session_key not in runner._agent_cache
+    assert session_key not in runner._running_agents
+    assert result is not None
+    assert "stopped" in result.lower()
+
+
+# ------------------------------------------------------------------
 # Test 6c: /stop clears pending messages to prevent stale replays
 # ------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -320,6 +349,42 @@ async def test_stop_clears_pending_messages():
     # Pending messages must be cleared
     assert session_key not in runner._pending_messages
     adapter.get_pending_message.assert_called_once_with(session_key)
+
+
+# ------------------------------------------------------------------
+# Test 6d: stale lock eviction tears down cached agent resources
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_stale_lock_eviction_closes_cached_agent_resources(monkeypatch):
+    """When the inactivity guard evicts a stale running-agent lock, the cached
+    agent must also be closed and evicted so leaked resources don't survive."""
+    runner = _make_runner()
+    event = _make_event(text="fresh prompt")
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {
+        "seconds_since_activity": 9999,
+        "last_activity_desc": "hung tool",
+        "api_call_count": 7,
+        "max_iterations": 90,
+    }
+    runner._running_agents[session_key] = fake_agent
+    runner._running_agents_ts[session_key] = 1.0
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {session_key: (fake_agent, "sig")}
+
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "1")
+
+    async def mock_inner(self_inner, ev, src, qk):
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    fake_agent.interrupt.assert_called_once_with("Stale session lock evicted")
+    fake_agent.close.assert_called_once()
+    assert session_key not in runner._agent_cache
 
 
 # ------------------------------------------------------------------

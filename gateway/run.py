@@ -2526,6 +2526,15 @@ class GatewayRunner:
                     _quick_key[:30], _stale_age, _stale_idle,
                     _raw_stale_timeout, _stale_detail,
                 )
+                try:
+                    if _stale_agent and _stale_agent is not _AGENT_PENDING_SENTINEL:
+                        _stale_agent.interrupt("Stale session lock evicted")
+                except Exception:
+                    pass
+                self._force_teardown_session_agent(
+                    _quick_key,
+                    running_agent=_stale_agent,
+                )
                 del self._running_agents[_quick_key]
                 self._running_agents_ts.pop(_quick_key, None)
 
@@ -2550,6 +2559,10 @@ class GatewayRunner:
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Stop requested")
+                self._force_teardown_session_agent(
+                    _quick_key,
+                    running_agent=running_agent,
+                )
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -2557,7 +2570,11 @@ class GatewayRunner:
                 self._pending_messages.pop(_quick_key, None)
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]
-                logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
+                self._running_agents_ts.pop(_quick_key, None)
+                logger.info(
+                    "STOP for session %s — agent interrupted, cached agent evicted, session lock released",
+                    _quick_key[:20],
+                )
                 return "⚡ Stopped. You can continue this session."
 
             # /reset and /new must bypass the running-agent guard so they
@@ -3964,24 +3981,10 @@ class GatewayRunner:
             logger.debug("Gateway memory flush on reset failed: %s", e)
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
-        # Guard with getattr because test fixtures may skip __init__.
-        _cache_lock = getattr(self, "_agent_cache_lock", None)
-        if _cache_lock is not None:
-            with _cache_lock:
-                _cached = self._agent_cache.get(session_key)
-                _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-            if _old_agent is not None:
-                try:
-                    if hasattr(_old_agent, "shutdown_memory_provider"):
-                        _old_agent.shutdown_memory_provider()
-                except Exception:
-                    pass
-                try:
-                    if hasattr(_old_agent, "close"):
-                        _old_agent.close()
-                except Exception:
-                    pass
-        self._evict_cached_agent(session_key)
+        self._force_teardown_session_agent(
+            session_key,
+            shutdown_memory_provider=True,
+        )
 
         try:
             from tools.env_passthrough import clear_env_passthrough
@@ -4144,14 +4147,20 @@ class GatewayRunner:
             # Force-clean the sentinel so the session is unlocked.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
+            self._running_agents_ts.pop(session_key, None)
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
         if agent:
             agent.interrupt("Stop requested")
+            self._force_teardown_session_agent(
+                session_key,
+                running_agent=agent,
+            )
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
+            self._running_agents_ts.pop(session_key, None)
             return "⚡ Stopped. You can continue this session."
         else:
             return "No active task to stop."
@@ -7407,6 +7416,72 @@ class GatewayRunner:
         if _lock:
             with _lock:
                 self._agent_cache.pop(session_key, None)
+
+    def _close_agent_resources(
+        self,
+        agent: Any,
+        *,
+        shutdown_memory_provider: bool = False,
+    ) -> None:
+        """Best-effort teardown for a session agent instance.
+
+        Use this when forcibly evicting a hung/stale session so subprocesses,
+        browser daemons, background jobs, and child agents do not survive in the
+        long-lived gateway process.
+        """
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            return
+        if shutdown_memory_provider:
+            try:
+                if hasattr(agent, "shutdown_memory_provider"):
+                    agent.shutdown_memory_provider()
+            except Exception:
+                pass
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+
+    def _force_teardown_session_agent(
+        self,
+        session_key: str,
+        *,
+        running_agent: Any = None,
+        shutdown_memory_provider: bool = False,
+    ) -> None:
+        """Tear down both running and cached agent state for a session.
+
+        The gateway caches AIAgent instances across turns.  When a session is
+        hard-stopped or a stale lock is evicted, dropping only
+        ``_running_agents`` unlocks the chat but leaves the cached agent and its
+        tool resources alive.  This helper forcibly closes those resources and
+        evicts the cache entry so the next turn starts from a fresh agent.
+        """
+        cached_agent = None
+        _lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _lock and _cache is not None:
+            with _lock:
+                cached = _cache.get(session_key)
+                cached_agent = (
+                    cached[0] if isinstance(cached, tuple) else cached if cached else None
+                )
+
+        seen: set[int] = set()
+        for candidate in (running_agent, cached_agent):
+            if not candidate or candidate is _AGENT_PENDING_SENTINEL:
+                continue
+            ident = id(candidate)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            self._close_agent_resources(
+                candidate,
+                shutdown_memory_provider=shutdown_memory_provider,
+            )
+
+        self._evict_cached_agent(session_key)
 
     # ------------------------------------------------------------------
     # Proxy mode: forward messages to a remote Hermes API server
