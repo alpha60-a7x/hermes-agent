@@ -71,6 +71,48 @@ def _ensure_ssl_certs() -> None:
 
 _ensure_ssl_certs()
 
+
+# Gateway-side practical prompt cap.
+#
+# Some providers expose very large context windows (for example 1M+ tokens), but
+# the gateway process can still OOM far below the model limit when it has to
+# rehydrate large transcripts, rebuild API payloads, and serialize them for the
+# client library. Keep the existing relative threshold as the primary policy for
+# smaller-context models, but clamp it with an absolute ceiling so session
+# hygiene fires before the process reaches a pathological memory spike.
+_GATEWAY_HYGIENE_HARD_PROMPT_TOKEN_LIMIT = 250_000
+_GATEWAY_HYGIENE_HARD_MSG_LIMIT = 400
+
+
+def _gateway_hygiene_token_threshold(
+    context_length: int,
+    threshold_pct: float,
+    *,
+    hard_prompt_token_limit: int = _GATEWAY_HYGIENE_HARD_PROMPT_TOKEN_LIMIT,
+) -> int:
+    """Return the effective pre-agent compression threshold for gateway hygiene."""
+    relative_threshold = int(context_length * threshold_pct)
+    return min(relative_threshold, hard_prompt_token_limit)
+
+
+def _should_gateway_hygiene_compress(
+    approx_tokens: int,
+    msg_count: int,
+    context_length: int,
+    threshold_pct: float,
+    *,
+    hard_prompt_token_limit: int = _GATEWAY_HYGIENE_HARD_PROMPT_TOKEN_LIMIT,
+    hard_msg_limit: int = _GATEWAY_HYGIENE_HARD_MSG_LIMIT,
+) -> tuple[bool, int]:
+    """Return (needs_compress, effective_token_threshold)."""
+    effective_threshold = _gateway_hygiene_token_threshold(
+        context_length,
+        threshold_pct,
+        hard_prompt_token_limit=hard_prompt_token_limit,
+    )
+    needs_compress = approx_tokens >= effective_threshold or msg_count >= hard_msg_limit
+    return needs_compress, effective_threshold
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -3388,9 +3430,6 @@ class GatewayRunner:
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
                 )
-                _compress_token_threshold = int(
-                    _hyg_context_length * _hyg_threshold_pct
-                )
                 _warn_token_threshold = int(_hyg_context_length * 0.95)
 
                 _msg_count = len(history)
@@ -3412,17 +3451,11 @@ class GatewayRunner:
                     # 85% * 1.4 = 119% of context — which exceeds the model's limit
                     # and prevented hygiene from ever firing for ~200K models (GLM-5).
 
-                # Hard safety valve: force compression if message count is
-                # extreme, regardless of token estimates.  This breaks the
-                # death spiral where API disconnects prevent token data
-                # collection, which prevents compression, which causes more
-                # disconnects.  400 messages is well above normal sessions
-                # but catches runaway growth before it becomes unrecoverable.
-                # (#2153)
-                _HARD_MSG_LIMIT = 400
-                _needs_compress = (
-                    _approx_tokens >= _compress_token_threshold
-                    or _msg_count >= _HARD_MSG_LIMIT
+                _needs_compress, _compress_token_threshold = _should_gateway_hygiene_compress(
+                    _approx_tokens,
+                    _msg_count,
+                    _hyg_context_length,
+                    _hyg_threshold_pct,
                 )
 
                 if _needs_compress:
