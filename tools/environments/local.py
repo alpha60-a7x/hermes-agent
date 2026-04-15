@@ -306,7 +306,11 @@ class LocalEnvironment(BaseEnvironment):
         self._extract_cwd_from_output(result)
 
     def cleanup(self):
-        """Clean up temp files."""
+        """Clean up temp files and any active foreground command."""
+        try:
+            self.cancel_active_process()
+        except Exception:
+            pass
         for f in (self._snapshot_path, self._cwd_file):
             try:
                 os.unlink(f)
