@@ -15,6 +15,15 @@ from hermes_cli.config import save_env_value_secure
 from hermes_constants import display_hermes_home
 
 
+def _sync_ready_notification(cli) -> None:
+    try:
+        sync = getattr(cli, "_sync_ready_notification", None)
+        if callable(sync):
+            sync()
+    except Exception:
+        pass
+
+
 def clarify_callback(cli, question, choices):
     """Prompt for clarifying question through the TUI.
 
@@ -35,6 +44,7 @@ def clarify_callback(cli, question, choices):
     }
     cli._clarify_deadline = _time.monotonic() + timeout
     cli._clarify_freetext = is_open_ended
+    _sync_ready_notification(cli)
 
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
@@ -54,6 +64,7 @@ def clarify_callback(cli, question, choices):
     cli._clarify_state = None
     cli._clarify_freetext = False
     cli._clarify_deadline = 0
+    _sync_ready_notification(cli)
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
     cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
@@ -109,6 +120,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
         "response_queue": response_queue,
     }
     cli._secret_deadline = _time.monotonic() + timeout
+    _sync_ready_notification(cli)
     # Avoid storing stale draft input as the secret when Enter is pressed.
     if hasattr(cli, "_clear_secret_input_buffer"):
         try:
@@ -129,6 +141,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
             value = response_queue.get(timeout=1)
             cli._secret_state = None
             cli._secret_deadline = 0
+            _sync_ready_notification(cli)
             if hasattr(cli, "_app") and cli._app:
                 cli._app.invalidate()
 
@@ -160,6 +173,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
 
     cli._secret_state = None
     cli._secret_deadline = 0
+    _sync_ready_notification(cli)
     if hasattr(cli, "_clear_secret_input_buffer"):
         try:
             cli._clear_secret_input_buffer()
@@ -215,6 +229,7 @@ def approval_callback(cli, command: str, description: str) -> str:
             "response_queue": response_queue,
         }
         cli._approval_deadline = _time.monotonic() + timeout
+        _sync_ready_notification(cli)
 
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
@@ -224,6 +239,7 @@ def approval_callback(cli, command: str, description: str) -> str:
                 result = response_queue.get(timeout=1)
                 cli._approval_state = None
                 cli._approval_deadline = 0
+                _sync_ready_notification(cli)
                 if hasattr(cli, "_app") and cli._app:
                     cli._app.invalidate()
                 return result
@@ -236,6 +252,7 @@ def approval_callback(cli, command: str, description: str) -> str:
 
         cli._approval_state = None
         cli._approval_deadline = 0
+        _sync_ready_notification(cli)
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
         cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")

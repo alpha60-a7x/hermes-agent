@@ -104,6 +104,7 @@ TIPS = [
 
     # --- Configuration ---
     "Set display.bell_on_complete: true in config.yaml to hear a bell when long tasks finish.",
+    "Set display.osc9_ready_on_waiting: true to emit an OSC 9 ready notification when Hermes is waiting for input again.",
     "Set display.streaming: true to see tokens appear in real time as the model generates.",
     "Set display.show_reasoning: true to watch the model's chain-of-thought reasoning.",
     "Set display.compact: true to reduce whitespace in output for denser information.",

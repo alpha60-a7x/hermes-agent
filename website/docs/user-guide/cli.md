@@ -368,7 +368,7 @@ When a background task finishes, the result appears as a panel in your terminal:
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
-If the task fails, you'll see an error notification instead. If `display.bell_on_complete` is enabled in your config, the terminal bell rings when the task finishes.
+If the task fails, you'll see an error notification instead. If `display.bell_on_complete` is enabled in your config, the terminal bell rings when the task finishes. If `display.osc9_ready_on_waiting` is enabled, Hermes also emits OSC 9 when the CLI returns to a waiting-for-input state.
 
 ### Use Cases
 

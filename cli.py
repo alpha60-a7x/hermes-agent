@@ -1621,6 +1621,7 @@ class HermesCLI:
         self.tool_progress_mode = "off" if _raw_tp is False else str(_raw_tp)
         # resume_display: "full" (show history) | "minimal" (one-liner only)
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
+        self.osc9_ready_on_waiting = CLI_CONFIG["display"].get("osc9_ready_on_waiting", False)
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
@@ -1823,6 +1824,7 @@ class HermesCLI:
         self._model_picker_state = None
         self._secret_state = None
         self._secret_deadline = 0
+        self._last_waiting_for_user_input = None
         self._spinner_text: str = ""  # thinking spinner text for TUI
         self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
         self._pending_tool_info: dict = {}  # function_name -> list of (preview, args) for stacked scrollback
@@ -2651,6 +2653,7 @@ class HermesCLI:
         """Expose a temporary busy state in the TUI while a slash command runs."""
         self._command_running = True
         self._command_status = status
+        self._sync_ready_notification()
         self._invalidate(min_interval=0.0)
         try:
             print(f"⏳ {status}")
@@ -2658,7 +2661,61 @@ class HermesCLI:
         finally:
             self._command_running = False
             self._command_status = ""
+            self._sync_ready_notification()
             self._invalidate(min_interval=0.0)
+
+    def _emit_terminal_escape(self, seq: str) -> None:
+        if not seq:
+            return
+        try:
+            out = getattr(sys, "__stdout__", None) or sys.stdout
+            if out is None:
+                return
+            try:
+                if hasattr(out, "isatty") and not out.isatty():
+                    return
+            except Exception:
+                return
+
+            data = seq.encode("utf-8", errors="ignore")
+            try:
+                os.write(out.fileno(), data)
+                return
+            except Exception:
+                pass
+
+            out.write(seq)
+            out.flush()
+        except Exception:
+            logger.debug("terminal escape emit failed", exc_info=True)
+
+    def _emit_ready_osc9(self) -> None:
+        self._emit_terminal_escape("\x1b]9;Hermes ready\x07")
+
+    def _is_waiting_for_user_input(self) -> bool:
+        if getattr(self, "_should_exit", False):
+            return False
+        return bool(
+            getattr(self, "_sudo_state", None)
+            or getattr(self, "_secret_state", None)
+            or getattr(self, "_approval_state", None)
+            or getattr(self, "_clarify_state", None)
+            or getattr(self, "_clarify_freetext", False)
+            or getattr(self, "_model_picker_state", None)
+            or (
+                not getattr(self, "_agent_running", False)
+                and not getattr(self, "_command_running", False)
+                and not getattr(self, "_voice_processing", False)
+                and not getattr(self, "_voice_recording", False)
+            )
+        )
+
+    def _sync_ready_notification(self) -> None:
+        waiting = self._is_waiting_for_user_input()
+        prev = getattr(self, "_last_waiting_for_user_input", None)
+        if waiting and prev is not True and getattr(self, "osc9_ready_on_waiting", False):
+            self._emit_ready_osc9()
+        self._last_waiting_for_user_input = waiting
 
     def _ensure_runtime_credentials(self) -> bool:
         """
@@ -7214,6 +7271,7 @@ class HermesCLI:
         self._clarify_freetext = is_open_ended
 
         # Trigger prompt_toolkit repaint from this (non-main) thread
+        self._sync_ready_notification()
         self._invalidate()
 
         # Poll for the user's response.  The countdown in the hint line
@@ -7248,6 +7306,7 @@ class HermesCLI:
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
+        self._sync_ready_notification()
         self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
@@ -7274,6 +7333,7 @@ class HermesCLI:
         }
         self._sudo_deadline = _time.monotonic() + timeout
 
+        self._sync_ready_notification()
         self._invalidate()
 
         while True:
@@ -7282,6 +7342,7 @@ class HermesCLI:
                 self._sudo_state = None
                 self._sudo_deadline = 0
                 self._restore_modal_input_snapshot()
+                self._sync_ready_notification()
                 self._invalidate()
                 if result:
                     _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
@@ -7297,6 +7358,7 @@ class HermesCLI:
         self._sudo_state = None
         self._sudo_deadline = 0
         self._restore_modal_input_snapshot()
+        self._sync_ready_notification()
         self._invalidate()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
@@ -7331,6 +7393,7 @@ class HermesCLI:
             }
             self._approval_deadline = _time.monotonic() + timeout
 
+            self._sync_ready_notification()
             self._invalidate()
 
             _last_countdown_refresh = _time.monotonic()
@@ -7339,6 +7402,7 @@ class HermesCLI:
                     result = response_queue.get(timeout=1)
                     self._approval_state = None
                     self._approval_deadline = 0
+                    self._sync_ready_notification()
                     self._invalidate()
                     return result
                 except queue.Empty:
@@ -7352,6 +7416,7 @@ class HermesCLI:
 
             self._approval_state = None
             self._approval_deadline = 0
+            self._sync_ready_notification()
             self._invalidate()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
@@ -7385,6 +7450,7 @@ class HermesCLI:
 
         state["response_queue"].put(chosen)
         self._approval_state = None
+        self._sync_ready_notification()
         self._invalidate()
 
     def _get_approval_display_fragments(self):
@@ -7502,6 +7568,7 @@ class HermesCLI:
         self._secret_state["response_queue"].put(value)
         self._secret_state = None
         self._secret_deadline = 0
+        self._sync_ready_notification()
         self._invalidate()
 
     def _cancel_secret_capture(self) -> None:
@@ -8274,6 +8341,7 @@ class HermesCLI:
         # Slash command loading state
         self._command_running = False
         self._command_status = ""
+        self._last_waiting_for_user_input = None
 
         # Secure secret capture state for skill setup
         self._secret_state = None       # dict with var_name, prompt, metadata, response_queue
@@ -9442,6 +9510,7 @@ class HermesCLI:
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         self._app = app  # Store reference for clarify_callback
+        self._sync_ready_notification()
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
         # When the terminal shrinks (e.g. un-maximize), the emulator reflows
@@ -9622,12 +9691,14 @@ class HermesCLI:
 
                     # Regular chat - run agent
                     self._agent_running = True
+                    self._sync_ready_notification()
                     app.invalidate()  # Refresh status line
 
                     try:
                         self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
+                        self._sync_ready_notification()
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
                         self._pending_tool_info.clear()
