@@ -2869,7 +2869,7 @@ class GatewayRunner:
                 )
                 del self._running_agents[_quick_key]
                 self._running_agents_ts.pop(_quick_key, None)
-                self._busy_ack_ts.pop(_quick_key, None)
+                getattr(self, "_busy_ack_ts", {}).pop(_quick_key, None)
 
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
