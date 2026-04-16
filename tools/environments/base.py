@@ -257,6 +257,8 @@ class BaseEnvironment(ABC):
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
+        self._active_process_lock = threading.Lock()
+        self._active_process: ProcessHandle | None = None
 
     # ------------------------------------------------------------------
     # Abstract methods
@@ -379,6 +381,32 @@ class BaseEnvironment(ABC):
     # Process lifecycle
     # ------------------------------------------------------------------
 
+    def _set_active_process(self, proc: ProcessHandle) -> None:
+        with self._active_process_lock:
+            self._active_process = proc
+
+    def _clear_active_process(self, proc: ProcessHandle | None = None) -> None:
+        with self._active_process_lock:
+            if proc is None or self._active_process is proc:
+                self._active_process = None
+
+    def cancel_active_process(self) -> bool:
+        """Best-effort terminate of the currently running foreground command."""
+        with self._active_process_lock:
+            proc = self._active_process
+        if proc is None:
+            return False
+
+        try:
+            if proc.poll() is None:
+                self._kill_process(proc)
+                return True
+        except Exception:
+            pass
+        finally:
+            self._clear_active_process(proc)
+        return False
+
     def _wait_for_process(self, proc: ProcessHandle, timeout: int = 120) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
@@ -402,52 +430,56 @@ class BaseEnvironment(ABC):
             except (ValueError, OSError):
                 pass
 
-        drain_thread = threading.Thread(target=_drain, daemon=True)
-        drain_thread.start()
-        deadline = time.monotonic() + timeout
-        _last_activity_touch = time.monotonic()
-        _ACTIVITY_INTERVAL = 10.0  # seconds between activity touches
-
-        while proc.poll() is None:
-            if is_interrupted():
-                self._kill_process(proc)
-                drain_thread.join(timeout=2)
-                return {
-                    "output": "".join(output_chunks) + "\n[Command interrupted]",
-                    "returncode": 130,
-                }
-            if time.monotonic() > deadline:
-                self._kill_process(proc)
-                drain_thread.join(timeout=2)
-                partial = "".join(output_chunks)
-                timeout_msg = f"\n[Command timed out after {timeout}s]"
-                return {
-                    "output": partial + timeout_msg
-                    if partial
-                    else timeout_msg.lstrip(),
-                    "returncode": 124,
-                }
-            # Periodic activity touch so the gateway knows we're alive
-            _now = time.monotonic()
-            if _now - _last_activity_touch >= _ACTIVITY_INTERVAL:
-                _last_activity_touch = _now
-                _cb = _get_activity_callback()
-                if _cb:
-                    try:
-                        _elapsed = int(_now - (deadline - timeout))
-                        _cb(f"terminal command running ({_elapsed}s elapsed)")
-                    except Exception:
-                        pass
-            time.sleep(0.2)
-
-        drain_thread.join(timeout=5)
-
+        self._set_active_process(proc)
         try:
-            proc.stdout.close()
-        except Exception:
-            pass
+            drain_thread = threading.Thread(target=_drain, daemon=True)
+            drain_thread.start()
+            deadline = time.monotonic() + timeout
+            _last_activity_touch = time.monotonic()
+            _ACTIVITY_INTERVAL = 10.0  # seconds between activity touches
 
-        return {"output": "".join(output_chunks), "returncode": proc.returncode}
+            while proc.poll() is None:
+                if is_interrupted():
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    return {
+                        "output": "".join(output_chunks) + "\n[Command interrupted]",
+                        "returncode": 130,
+                    }
+                if time.monotonic() > deadline:
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    partial = "".join(output_chunks)
+                    timeout_msg = f"\n[Command timed out after {timeout}s]"
+                    return {
+                        "output": partial + timeout_msg
+                        if partial
+                        else timeout_msg.lstrip(),
+                        "returncode": 124,
+                    }
+                # Periodic activity touch so the gateway knows we're alive
+                _now = time.monotonic()
+                if _now - _last_activity_touch >= _ACTIVITY_INTERVAL:
+                    _last_activity_touch = _now
+                    _cb = _get_activity_callback()
+                    if _cb:
+                        try:
+                            _elapsed = int(_now - (deadline - timeout))
+                            _cb(f"terminal command running ({_elapsed}s elapsed)")
+                        except Exception:
+                            pass
+                time.sleep(0.2)
+
+            drain_thread.join(timeout=5)
+
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+            return {"output": "".join(output_chunks), "returncode": proc.returncode}
+        finally:
+            self._clear_active_process(proc)
 
     def _kill_process(self, proc: ProcessHandle):
         """Terminate a process. Subclasses may override for process-group kill."""
